@@ -268,6 +268,15 @@ type readCache struct {
 
 	rsz int32 // Read buffer size
 	srs int32 // Short reads, used for dynamic buffer resizing.
+
+	// When gateways are enabled, this holds recent subscriptions. A subscription
+	// that is added to this list is cleared after a short period of time. When
+	// a message needs to cross a gateway and has a reply, the reply is prefixed
+	// with the cluster name of origin if there is a matching subscription in that
+	// list. This is in order to solve req/reply race where the reply may be
+	// processed in a destination cluster before the subscription interest for
+	// that reply makes it there (due to different outbound/inbound connections).
+	rsubs *Sublist
 }
 
 const (
@@ -2258,7 +2267,7 @@ func (c *client) processInboundClientMsg(msg []byte) {
 			atomic.LoadInt64(&c.srv.gateway.totalQSubs) > 0 {
 			collect = true
 		}
-		qnames = c.processMsgResults(c.acc, r, msg, c.pa.subject, c.pa.reply, collect)
+		qnames = c.processMsgResults(c.acc, r, msg, c.pa.subject, c.pa.reply, collect, false)
 	}
 
 	// Now deal with gateways
@@ -2293,7 +2302,7 @@ func (c *client) checkForImportServices(acc *Account, msg []byte) {
 			// and possibly to inbound GW connections for
 			// which we are in interest-only mode.
 			if c.kind == CLIENT && c.srv.gateway.enabled {
-				c.srv.gatewayHandleServiceImport(rm.acc, nrr, 1)
+				c.srv.gatewayHandleServiceImport(rm.acc, nrr, c, 1)
 			}
 		}
 		// FIXME(dlc) - Do L1 cache trick from above.
@@ -2304,7 +2313,7 @@ func (c *client) checkForImportServices(acc *Account, msg []byte) {
 			c.makeQFilter(rr.qsubs)
 		}
 		sendToGWs := c.srv.gateway.enabled && (c.kind == CLIENT || c.kind == SYSTEM)
-		queues := c.processMsgResults(rm.acc, rr, msg, []byte(rm.to), nrr, sendToGWs)
+		queues := c.processMsgResults(rm.acc, rr, msg, []byte(rm.to), nrr, sendToGWs, false)
 		// If this is not a gateway connection but gateway is enabled,
 		// try to send this converted message to all gateways.
 		if sendToGWs {
@@ -2349,7 +2358,9 @@ func (c *client) addSubToRouteTargets(sub *subscription) {
 }
 
 // This processes the sublist results for a given message.
-func (c *client) processMsgResults(acc *Account, r *SublistResult, msg, subject, reply []byte, collect bool) [][]byte {
+func (c *client) processMsgResults(acc *Account, r *SublistResult, msg, subject, reply []byte,
+	collectQueueNames, allowGWQueuesWithoutFilter bool) [][]byte {
+
 	var queues [][]byte
 	// msg header for clients.
 	msgh := c.msgb[1:msgHeadProtoLen]
@@ -2401,9 +2412,11 @@ func (c *client) processMsgResults(acc *Account, r *SublistResult, msg, subject,
 	// guidance on which queue groups we should deliver to.
 	qf := c.pa.queues
 
-	// For gateway connections, we still want to send messages to routes
-	// even if there are no queue filters.
-	if c.kind == GATEWAY && qf == nil {
+	// For gateway connections, if allowGWQueuesWithoutFilter is true,
+	// really treat this as if it was a client connection and possibly
+	// pick queue subs. If not, we still want to send messages to routes
+	// even if there is no queue filter.
+	if c.kind == GATEWAY && !allowGWQueuesWithoutFilter && qf == nil {
 		goto sendToRoutes
 	}
 
@@ -2456,7 +2469,7 @@ func (c *client) processMsgResults(acc *Account, r *SublistResult, msg, subject,
 					continue
 				} else {
 					c.addSubToRouteTargets(sub)
-					if collect {
+					if collectQueueNames {
 						queues = append(queues, sub.queue)
 					}
 				}
@@ -2476,7 +2489,7 @@ func (c *client) processMsgResults(acc *Account, r *SublistResult, msg, subject,
 			if c.deliverMsg(sub, mh, msg) {
 				// Clear rsub
 				rsub = nil
-				if collect {
+				if collectQueueNames {
 					queues = append(queues, sub.queue)
 				}
 				break
@@ -2487,7 +2500,7 @@ func (c *client) processMsgResults(acc *Account, r *SublistResult, msg, subject,
 			// If we are here we tried to deliver to a local qsub
 			// but failed. So we will send it to a remote.
 			c.addSubToRouteTargets(rsub)
-			if collect {
+			if collectQueueNames {
 				queues = append(queues, rsub.queue)
 			}
 		}
