@@ -1195,6 +1195,11 @@ func (s *Server) processImplicitGateway(info *Info) {
 	})
 }
 
+// NumOutboundGateways is public here mostly for testing.
+func (s *Server) NumOutboundGateways() int {
+	return s.numOutboundGateways()
+}
+
 // Returns the number of outbound gateway connections
 func (s *Server) numOutboundGateways() int {
 	s.gateway.RLock()
@@ -1586,6 +1591,7 @@ func (c *client) processGatewayRUnsub(arg []byte) error {
 				c.gw.outsim.Delete(accName)
 			}
 		}
+		defer c.srv.updateInterestForAccountOnGateway(accName, sub, -1)
 	} else {
 		e.ni[string(subject)] = struct{}{}
 		if newe {
@@ -1687,6 +1693,7 @@ func (c *client) processGatewayRSub(arg []byte) error {
 				atomic.AddInt64(&c.srv.gateway.totalQSubs, 1)
 			}
 		}
+		defer c.srv.updateInterestForAccountOnGateway(string(accName), sub, 1)
 	} else {
 		subj := string(subject)
 		// If this is an RS+ for a wc subject, then
@@ -1747,6 +1754,27 @@ func (c *client) gatewayInterest(acc, subj string) (bool, *SublistResult) {
 		}
 	}
 	return psi, r
+}
+
+// switchAccountToInterestMode will switch an account over to interestMode.
+// Lock should NOT be held.
+func (s *Server) switchAccountToInterestMode(accName string) {
+	gwsa := [16]*client{}
+	gws := gwsa[:0]
+	s.getInboundGatewayConnections(&gws)
+
+	for _, gin := range gws {
+		var e *insie
+		var ok bool
+
+		gin.mu.Lock()
+		if e, ok = gin.gw.insim[accName]; !ok {
+			e = &insie{}
+			gin.gw.insim[accName] = e
+		}
+		gin.gatewaySwitchAccountToSendAllSubs(e, []byte(accName))
+		gin.mu.Unlock()
+	}
 }
 
 // This is invoked when registering (or unregistering) the first
@@ -1961,8 +1989,8 @@ func (s *Server) gatewayUpdateSubInterest(accName string, sub *subscription, cha
 }
 
 // May send a message to all outbound gateways. It is possible
-// that message is not sent to a given gateway if for instance
-// it is known that this gateway has no interest in account or
+// that the message is not sent to a given gateway if for instance
+// it is known that this gateway has no interest in the account or
 // subject, etc..
 // <Invoked from any client connection's readLoop>
 func (c *client) sendMsgToGateways(acc *Account, msg, subject, reply []byte, qgroups [][]byte) {
@@ -2250,6 +2278,12 @@ func (c *client) gatewayAllSubsReceiveStart(info *Info) {
 		e.Lock()
 		e.mode = modeTransitioning
 		e.Unlock()
+	} else {
+		e := &outsie{sl: NewSublist()}
+		e.mode = modeTransitioning
+		c.mu.Lock()
+		c.gw.outsim.Store(account, e)
+		c.mu.Unlock()
 	}
 }
 
@@ -2316,6 +2350,7 @@ func (c *client) gatewaySwitchAccountToSendAllSubs(e *insie, accName []byte) {
 			GatewayCmd:        cmd,
 			GatewayCmdPayload: []byte(account),
 		}
+
 		b, _ := json.Marshal(&info)
 		infoJSON := []byte(fmt.Sprintf(InfoProto, b))
 		if useLock {

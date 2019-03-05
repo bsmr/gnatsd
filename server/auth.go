@@ -235,6 +235,8 @@ func (s *Server) checkAuthentication(c *client) bool {
 		return s.isRouterAuthorized(c)
 	case GATEWAY:
 		return s.isGatewayAuthorized(c)
+	case LEAF:
+		return s.isLeafNodeAuthorized(c)
 	default:
 		return false
 	}
@@ -525,6 +527,12 @@ func (s *Server) isGatewayAuthorized(c *client) bool {
 		return false
 	}
 	return comparePasswords(opts.Gateway.Password, c.opts.Password)
+}
+
+// isLeafNodeAuthorized will check for auth for an inbound leaf node connection.
+func (s *Server) isLeafNodeAuthorized(c *client) bool {
+	// FIXME(dlc) - Implement the auth checks.
+	return true
 }
 
 // Support for bcrypt stored passwords and tokens.

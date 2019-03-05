@@ -1,0 +1,751 @@
+// Copyright 2019 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package test
+
+import (
+	"fmt"
+	"net"
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/nats-io/gnatsd/server"
+)
+
+func createLeafConn(t tLogger, host string, port int) net.Conn {
+	return createClientConn(t, host, port)
+}
+
+func testDefaultOptionsForLeafNodes() *server.Options {
+	o := DefaultTestOptions
+	o.Host = "127.0.0.1"
+	o.Port = -1
+	o.LeafNode.Port = -1
+	return &o
+}
+
+func runLeafServer() (*server.Server, *server.Options) {
+	o := testDefaultOptionsForLeafNodes()
+	return RunServer(o), o
+}
+
+func runLeafServerOnPort(port int) (*server.Server, *server.Options) {
+	o := testDefaultOptionsForLeafNodes()
+	o.LeafNode.Port = port
+	return RunServer(o), o
+}
+
+func runSolicitLeafServer(lso *server.Options) (*server.Server, *server.Options) {
+	o := DefaultTestOptions
+	o.Host = "127.0.0.1"
+	o.Port = -1
+	rurl, _ := url.Parse(fmt.Sprintf("nats-leaf://%s:%d", lso.LeafNode.Host, lso.LeafNode.Port))
+	o.LeafNode.Remotes = []*server.RemoteLeafOpts{&server.RemoteLeafOpts{URL: rurl}}
+	return RunServer(&o), &o
+}
+
+func TestLeafNodeInfo(t *testing.T) {
+	s, opts := runLeafServer()
+	defer s.Shutdown()
+
+	lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
+	defer lc.Close()
+
+	info := checkInfoMsg(t, lc)
+	if !info.AuthRequired {
+		t.Fatalf("AuthRequired should always be true for leaf nodes")
+	}
+
+	// Make sure we are accounting for the leaf node and tracking it.
+	if nln := s.NumLeafNodes(); nln != 1 {
+		t.Fatalf("Expected 1 leaf node, got %d", nln)
+	}
+
+	// Now close connection, make sure we are doing the right accounting in the server.
+	lc.Close()
+
+	checkFor(t, time.Second, 10*time.Millisecond, func() error {
+		if nln := s.NumLeafNodes(); nln != 0 {
+			return fmt.Errorf("Number of leaf nodes is %d", nln)
+		}
+		return nil
+	})
+}
+
+func TestNumLeafNodes(t *testing.T) {
+	s, opts := runLeafServer()
+	defer s.Shutdown()
+
+	createNewLeafNode := func() net.Conn {
+		lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
+		checkInfoMsg(t, lc)
+		return lc
+	}
+	if nln := s.NumLeafNodes(); nln != 0 {
+		t.Fatalf("Expected NumLeafNodes() == %d, got %d", 0, nln)
+	}
+	lc1 := createNewLeafNode()
+	defer lc1.Close()
+	if nln := s.NumLeafNodes(); nln != 1 {
+		t.Fatalf("Expected NumLeafNodes() == %d, got %d", 1, nln)
+	}
+	lc2 := createNewLeafNode()
+	defer lc2.Close()
+	if nln := s.NumLeafNodes(); nln != 2 {
+		t.Fatalf("Expected NumLeafNodes() == %d, got %d", 2, nln)
+	}
+	// Now test remove works.
+	closeAndWait := func(c net.Conn) {
+		c.Close()
+		time.Sleep(25 * time.Millisecond)
+	}
+	closeAndWait(lc1)
+	if nln := s.NumLeafNodes(); nln != 1 {
+		t.Fatalf("Expected NumLeafNodes() == %d, got %d", 1, nln)
+	}
+	closeAndWait(lc2)
+	if nln := s.NumLeafNodes(); nln != 0 {
+		t.Fatalf("Expected NumLeafNodes() == %d, got %d", 0, nln)
+	}
+}
+
+func TestLeafNodeRequiresConnect(t *testing.T) {
+	opts := testDefaultOptionsForLeafNodes()
+	opts.LeafNode.AuthTimeout = 0.001
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
+	defer lc.Close()
+
+	info := checkInfoMsg(t, lc)
+	if !info.AuthRequired {
+		t.Fatalf("Expected AuthRequired to force CONNECT")
+	}
+	// Now wait and make sure we get disconnected.
+	time.Sleep(5 * time.Millisecond)
+	errBuf := expectResult(t, lc, errRe)
+
+	if !strings.Contains(string(errBuf), "Authentication Timeout") {
+		t.Fatalf("Authentication Timeout response incorrect: %q", errBuf)
+	}
+	expectDisconnect(t, lc)
+}
+
+func TestLeafNodeSendsSubsAfterConnect(t *testing.T) {
+	s, opts := runLeafServer()
+	defer s.Shutdown()
+
+	c := createClientConn(t, opts.Host, opts.Port)
+	defer c.Close()
+
+	send, expect := setupConn(t, c)
+	send("SUB foo 1\r\n")
+	send("SUB bar 2\r\n")
+	send("SUB foo baz 3\r\n")
+	send("SUB foo baz 4\r\n")
+	send("SUB bar 5\r\n")
+	send("PING\r\n")
+	expect(pongRe)
+
+	lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
+	defer lc.Close()
+
+	_, leafExpect := setupConn(t, lc)
+	matches := lsubRe.FindAllSubmatch(leafExpect(lsubRe), -1)
+	// This should compress down to 1 for foo, 1 for bar, and 1 for foo [baz]
+	if len(matches) != 3 {
+		t.Fatalf("Expected 3 results, got %d", len(matches))
+	}
+}
+
+func TestLeafNodeSendsSubsOngoing(t *testing.T) {
+	s, opts := runLeafServer()
+	defer s.Shutdown()
+
+	c := createClientConn(t, opts.Host, opts.Port)
+	defer c.Close()
+
+	send, expect := setupConn(t, c)
+	send("PING\r\n")
+	expect(pongRe)
+
+	lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
+	defer lc.Close()
+
+	leafSend, leafExpect := setupConn(t, lc)
+	leafSend("PING\r\n")
+	leafExpect(pongRe)
+
+	send("SUB foo 1\r\n")
+	leafExpect(lsubRe)
+
+	// Check queues send updates each time.
+	// TODO(dlc) - If we decide to suppress this with a timer approach this test will break.
+	send("SUB foo bar 2\r\n")
+	leafExpect(lsubRe)
+	send("SUB foo bar 3\r\n")
+	leafExpect(lsubRe)
+	send("SUB foo bar 4\r\n")
+	leafExpect(lsubRe)
+
+	// Now check more normal subs do nothing.
+	send("SUB foo 5\r\n")
+	expectNothing(t, lc)
+
+	// Check going back down does nothing til we hit 0.
+	send("UNSUB 5\r\n")
+	expectNothing(t, lc)
+	send("UNSUB 1\r\n")
+	leafExpect(lunsubRe)
+
+	// Queues going down should always send updates.
+	send("UNSUB 2\r\n")
+	leafExpect(lsubRe)
+	send("UNSUB 3\r\n")
+	leafExpect(lsubRe)
+	send("UNSUB 4\r\n")
+	leafExpect(lunsubRe)
+}
+
+func TestLeafNodeSubs(t *testing.T) {
+	s, opts := runLeafServer()
+	defer s.Shutdown()
+
+	lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
+	defer lc.Close()
+
+	leafSend, leafExpect := setupConn(t, lc)
+
+	leafSend("PING\r\n")
+	leafExpect(pongRe)
+
+	leafSend("LS+ foo\r\n")
+	expectNothing(t, lc)
+	leafSend("PING\r\n")
+	leafExpect(pongRe)
+
+	c := createClientConn(t, opts.Host, opts.Port)
+	defer c.Close()
+
+	send, expect := setupConn(t, c)
+	send("PING\r\n")
+	expect(pongRe)
+
+	send("PUB foo 2\r\nOK\r\n")
+	matches := lmsgRe.FindAllSubmatch(leafExpect(lmsgRe), -1)
+	if len(matches) != 1 {
+		t.Fatalf("Expected only 1 msg, got %d", len(matches))
+	}
+	checkLmsg(t, matches[0], "foo", "", "2", "OK")
+
+	// Second sub should not change delivery
+	leafSend("LS+ foo\r\n")
+	expectNothing(t, lc)
+	leafSend("PING\r\n")
+	leafExpect(pongRe)
+
+	send("PUB foo 3\r\nOK!\r\n")
+	matches = lmsgRe.FindAllSubmatch(leafExpect(lmsgRe), -1)
+	if len(matches) != 1 {
+		t.Fatalf("Expected only 1 msg, got %d", len(matches))
+	}
+	checkLmsg(t, matches[0], "foo", "", "3", "OK!")
+
+	// Now add in a queue sub with weight 4.
+	leafSend("LS+ foo bar 4\r\n")
+	expectNothing(t, lc)
+	leafSend("PING\r\n")
+	leafExpect(pongRe)
+
+	send("PUB foo 4\r\nOKOK\r\n")
+	matches = lmsgRe.FindAllSubmatch(leafExpect(lmsgRe), -1)
+	if len(matches) != 1 {
+		t.Fatalf("Expected only 1 msg, got %d", len(matches))
+	}
+	checkLmsg(t, matches[0], "foo", "| bar", "4", "OKOK")
+
+	// Now add in a queue sub with weight 4.
+	leafSend("LS+ foo baz 2\r\n")
+	expectNothing(t, lc)
+	leafSend("PING\r\n")
+	leafExpect(pongRe)
+
+	send("PUB foo 5\r\nHELLO\r\n")
+	matches = lmsgRe.FindAllSubmatch(leafExpect(lmsgRe), -1)
+	if len(matches) != 1 {
+		t.Fatalf("Expected only 1 msg, got %d", len(matches))
+	}
+	checkLmsg(t, matches[0], "foo", "| bar baz", "5", "HELLO")
+
+	// Test Unsub
+	leafSend("LS- foo\r\n")
+	leafSend("LS- foo bar\r\n")
+	leafSend("LS- foo baz\r\n")
+	expectNothing(t, lc)
+	leafSend("PING\r\n")
+	leafExpect(pongRe)
+
+	send("PUB foo 5\r\nHELLO\r\n")
+	expectNothing(t, lc)
+}
+
+func TestLeafNodeMsgDelivery(t *testing.T) {
+	s, opts := runLeafServer()
+	defer s.Shutdown()
+
+	lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
+	defer lc.Close()
+
+	leafSend, leafExpect := setupConn(t, lc)
+
+	leafSend("PING\r\n")
+	leafExpect(pongRe)
+
+	c := createClientConn(t, opts.Host, opts.Port)
+	defer c.Close()
+
+	send, expect := setupConn(t, c)
+	send("PING\r\n")
+	expect(pongRe)
+
+	send("SUB foo 1\r\nPING\r\n")
+	expect(pongRe)
+	leafExpect(lsubRe)
+
+	// Now send from leaf side.
+	leafSend("LMSG foo 2\r\nOK\r\n")
+	expectNothing(t, lc)
+
+	matches := msgRe.FindAllSubmatch(expect(msgRe), -1)
+	if len(matches) != 1 {
+		t.Fatalf("Expected only 1 msg, got %d", len(matches))
+	}
+	checkMsg(t, matches[0], "foo", "1", "", "2", "OK")
+
+	send("UNSUB 1\r\nPING\r\n")
+	expect(pongRe)
+	leafExpect(lunsubRe)
+	send("SUB foo bar 2\r\nPING\r\n")
+	expect(pongRe)
+	leafExpect(lsubRe)
+
+	// Now send again from leaf side. This is targeted so this should
+	// not be delivered.
+	leafSend("LMSG foo 2\r\nOK\r\n")
+	expectNothing(t, lc)
+	expectNothing(t, c)
+
+	// Now send targeted, and we should receive it.
+	leafSend("LMSG foo | bar 2\r\nOK\r\n")
+	expectNothing(t, lc)
+
+	matches = msgRe.FindAllSubmatch(expect(msgRe), -1)
+	if len(matches) != 1 {
+		t.Fatalf("Expected only 1 msg, got %d", len(matches))
+	}
+	checkMsg(t, matches[0], "foo", "2", "", "2", "OK")
+
+	// Check reply + queues
+	leafSend("LMSG foo + myreply bar 2\r\nOK\r\n")
+	expectNothing(t, lc)
+
+	matches = msgRe.FindAllSubmatch(expect(msgRe), -1)
+	if len(matches) != 1 {
+		t.Fatalf("Expected only 1 msg, got %d", len(matches))
+	}
+	checkMsg(t, matches[0], "foo", "2", "myreply", "2", "OK")
+}
+
+func TestLeafNodeAndRoutes(t *testing.T) {
+	srvA, optsA := RunServerWithConfig("./configs/srv_a_leaf.conf")
+	srvB, optsB := RunServerWithConfig("./configs/srv_b.conf")
+	checkClusterFormed(t, srvA, srvB)
+	defer srvA.Shutdown()
+	defer srvB.Shutdown()
+
+	lc := createLeafConn(t, optsA.LeafNode.Host, optsA.LeafNode.Port)
+	defer lc.Close()
+
+	leafSend, leafExpect := setupConn(t, lc)
+	leafSend("PING\r\n")
+	leafExpect(pongRe)
+
+	c := createClientConn(t, optsB.Host, optsB.Port)
+	defer c.Close()
+
+	send, expect := setupConn(t, c)
+	send("PING\r\n")
+	expect(pongRe)
+
+	send("SUB foo 1\r\nPING\r\n")
+	expect(pongRe)
+	leafExpect(lsubRe)
+
+	send("SUB foo 2\r\nPING\r\n")
+	expect(pongRe)
+	expectNothing(t, lc)
+
+	send("UNSUB 2\r\n")
+	expectNothing(t, lc)
+	send("UNSUB 1\r\n")
+	leafExpect(lunsubRe)
+
+	// Now put it back and test msg flow.
+	send("SUB foo 1\r\nPING\r\n")
+	expect(pongRe)
+	leafExpect(lsubRe)
+
+	leafSend("LMSG foo + myreply bar 2\r\nOK\r\n")
+	expectNothing(t, lc)
+
+	matches := msgRe.FindAllSubmatch(expect(msgRe), -1)
+	if len(matches) != 1 {
+		t.Fatalf("Expected only 1 msg, got %d", len(matches))
+	}
+	checkMsg(t, matches[0], "foo", "1", "myreply", "2", "OK")
+
+	// Now check reverse.
+	leafSend("LS+ bar\r\n")
+	expectNothing(t, lc)
+	leafSend("PING\r\n")
+	leafExpect(pongRe)
+
+	send("PUB bar 2\r\nOK\r\n")
+	matches = lmsgRe.FindAllSubmatch(leafExpect(lmsgRe), -1)
+	if len(matches) != 1 {
+		t.Fatalf("Expected only 1 msg, got %d", len(matches))
+	}
+	checkLmsg(t, matches[0], "bar", "", "2", "OK")
+}
+
+// Helper function to check that a leaf node has connected to our server.
+func checkLeafNodeConnected(t *testing.T, s *server.Server) {
+	t.Helper()
+	checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
+		if nln := s.NumLeafNodes(); nln != 1 {
+			return fmt.Errorf("Expected a connected leafnode for server %q, got none", s.ID())
+		}
+		return nil
+	})
+}
+
+func TestLeafNodeSolicit(t *testing.T) {
+	s, opts := runLeafServer()
+	defer s.Shutdown()
+
+	sl, _ := runSolicitLeafServer(opts)
+	defer sl.Shutdown()
+
+	checkLeafNodeConnected(t, s)
+
+	// Now test reconnect.
+	s.Shutdown()
+	// Need to restart it on the same port.
+	s, _ = runLeafServerOnPort(opts.LeafNode.Port)
+	checkLeafNodeConnected(t, s)
+}
+
+func TestLeafNodeNoEcho(t *testing.T) {
+	s, opts := runLeafServer()
+	defer s.Shutdown()
+
+	c := createClientConn(t, opts.Host, opts.Port)
+	defer c.Close()
+
+	send, expect := setupConn(t, c)
+	send("PING\r\n")
+	expect(pongRe)
+
+	lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
+	defer lc.Close()
+
+	leafSend, leafExpect := setupConn(t, lc)
+	leafSend("PING\r\n")
+	leafExpect(pongRe)
+
+	// We should not echo back to ourselves. Set up 'foo' subscriptions
+	// on both sides and send message across the leafnode connection. It
+	// should not come back.
+
+	send("SUB foo 1\r\n")
+	leafExpect(lsubRe)
+
+	leafSend("LS+ foo\r\n")
+	expectNothing(t, lc)
+	leafSend("PING\r\n")
+	leafExpect(pongRe)
+
+	leafSend("LMSG foo 2\r\nOK\r\n")
+	expectNothing(t, lc)
+}
+
+// Used to setup clusters of clusters for tests.
+type cluster struct {
+	servers []*server.Server
+	opts    []*server.Options
+	name    string
+}
+
+func testDefaultClusterOptionsForLeafNodes() *server.Options {
+	o := DefaultTestOptions
+	o.Host = "127.0.0.1"
+	o.Port = -1
+	o.Cluster.Host = o.Host
+	o.Cluster.Port = -1
+	o.Gateway.Host = o.Host
+	o.Gateway.Port = -1
+	o.LeafNode.Port = -1
+	return &o
+}
+
+func shutdownCluster(c *cluster) {
+	if c == nil {
+		return
+	}
+	for _, s := range c.servers {
+		s.Shutdown()
+	}
+}
+
+// Wait for the expected number of outbound gateways, or fails.
+func waitForOutboundGateways(t *testing.T, s *server.Server, expected int, timeout time.Duration) {
+	t.Helper()
+	checkFor(t, timeout, 15*time.Millisecond, func() error {
+		if n := s.NumOutboundGateways(); n != expected {
+			return fmt.Errorf("Expected %v outbound gateway(s), got %v", expected, n)
+		}
+		return nil
+	})
+}
+
+// Creates a full cluster with numServers and given name and makes sure its well formed.
+// Will have Gateways and Leaf Node connections active.
+func createClusterWithName(t *testing.T, clusterName string, numServers int, connectTo ...*cluster) *cluster {
+	t.Helper()
+
+	if clusterName == "" || numServers < 1 {
+		t.Fatalf("Bad params")
+	}
+
+	// If we are going to connect to another cluster set that up now for options.
+	var gws []*server.RemoteGatewayOpts
+	for _, c := range connectTo {
+		// Gateways autodiscover here too, so just need one address from the set.
+		gwAddr := fmt.Sprintf("nats-gw://%s:%d", c.opts[0].Gateway.Host, c.opts[0].Gateway.Port)
+		gwurl, _ := url.Parse(gwAddr)
+		gws = append(gws, &server.RemoteGatewayOpts{Name: c.name, URLs: []*url.URL{gwurl}})
+	}
+
+	// Create seed first.
+	o := testDefaultClusterOptionsForLeafNodes()
+	o.Gateway.Name = clusterName
+	o.Gateway.Gateways = gws
+	// All of these need system accounts.
+	o.Accounts = []*server.Account{server.NewAccount("$SYS")}
+	o.SystemAccount = "$SYS"
+	s := RunServer(o)
+
+	c := &cluster{servers: make([]*server.Server, 0, 3), opts: make([]*server.Options, 0, 3), name: clusterName}
+	c.servers = append(c.servers, s)
+	c.opts = append(c.opts, o)
+
+	// For connecting to seed server above.
+	routeAddr := fmt.Sprintf("nats-route://%s:%d", o.Cluster.Host, o.Cluster.Port)
+	rurl, _ := url.Parse(routeAddr)
+	routes := []*url.URL{rurl}
+
+	for i := 1; i < numServers; i++ {
+		o := testDefaultClusterOptionsForLeafNodes()
+		o.Gateway.Name = clusterName
+		o.Gateway.Gateways = gws
+		o.Routes = routes
+		// All of these need system accounts.
+		o.Accounts = []*server.Account{server.NewAccount("$SYS")}
+		o.SystemAccount = "$SYS"
+		s := RunServer(o)
+		c.servers = append(c.servers, s)
+		c.opts = append(c.opts, o)
+	}
+	checkClusterFormed(t, c.servers...)
+
+	// Wait on gateway connections if we were asked to connect to other gateways.
+	if numGWs := len(connectTo); numGWs > 0 {
+		for _, s := range c.servers {
+			waitForOutboundGateways(t, s, numGWs, time.Second)
+		}
+	}
+
+	return c
+}
+
+func TestLeafNodeGatewayRequiresSystemAccount(t *testing.T) {
+	o := testDefaultClusterOptionsForLeafNodes()
+	o.Gateway.Name = "CLUSTER-A"
+	_, err := server.NewServer(o)
+	if err == nil {
+		t.Fatalf("Expected an error with no system account defined")
+	}
+}
+
+func TestLeafNodeGatewaySendsSystemEvent(t *testing.T) {
+	ca := createClusterWithName(t, "A", 1)
+	defer shutdownCluster(ca)
+	cb := createClusterWithName(t, "B", 1, ca)
+	defer shutdownCluster(cb)
+
+	// Create client on a server in cluster A
+	opts := ca.opts[0]
+	c := createClientConn(t, opts.Host, opts.Port)
+	defer c.Close()
+
+	// Listen for the leaf node event.
+	send, expect := setupConnWithAccount(t, c, "$SYS")
+	send("SUB $SYS.ACCOUNT.*.LEAFNODE.CONNECT 1\r\nPING\r\n")
+	expect(pongRe)
+
+	opts = cb.opts[0]
+	lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
+	defer lc.Close()
+
+	leafSend, leafExpect := setupConn(t, lc)
+	leafSend("PING\r\n")
+	leafExpect(pongRe)
+
+	matches := rawMsgRe.FindAllSubmatch(expect(rawMsgRe), -1)
+	if len(matches) != 1 {
+		t.Fatalf("Expected only 1 msg, got %d", len(matches))
+	}
+	m := matches[0]
+	if string(m[subIndex]) != "$SYS.ACCOUNT.$G.LEAFNODE.CONNECT" {
+		t.Fatalf("Got wrong subject for leaf node event, got %q, wanted %q",
+			m[subIndex], "$SYS.ACCOUNT.$G.LEAFNODE.CONNECT")
+	}
+}
+
+func TestLeafNodeWithRouteAndGateway(t *testing.T) {
+	ca := createClusterWithName(t, "A", 3)
+	defer shutdownCluster(ca)
+	cb := createClusterWithName(t, "B", 3, ca)
+	defer shutdownCluster(cb)
+
+	// Create client on a server in cluster A
+	opts := ca.opts[0]
+	c := createClientConn(t, opts.Host, opts.Port)
+	defer c.Close()
+
+	send, expect := setupConn(t, c)
+	send("PING\r\n")
+	expect(pongRe)
+
+	// Create a leaf node connection on a server in cluster B
+	opts = cb.opts[0]
+	lc := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
+	defer lc.Close()
+
+	leafSend, leafExpect := setupConn(t, lc)
+	leafSend("PING\r\n")
+	leafExpect(pongRe)
+
+	// Make sure we see interest graph propagation on the leaf node
+	// connection. This is required since leaf nodes only send data
+	// in the presence of interest.
+	send("SUB foo 1\r\nPING\r\n")
+	expect(pongRe)
+	leafExpect(lsubRe)
+
+	send("SUB foo 2\r\nPING\r\n")
+	expect(pongRe)
+	expectNothing(t, lc)
+
+	send("UNSUB 2\r\n")
+	expectNothing(t, lc)
+	send("UNSUB 1\r\n")
+	leafExpect(lunsubRe)
+
+	// Now put it back and test msg flow.
+	send("SUB foo 1\r\nPING\r\n")
+	expect(pongRe)
+	leafExpect(lsubRe)
+
+	//leafSend("LMSG foo + myreply bar 2\r\nOK\r\n")
+	leafSend("LMSG foo 2\r\nOK\r\n")
+	expectNothing(t, lc)
+
+	matches := msgRe.FindAllSubmatch(expect(msgRe), -1)
+	if len(matches) != 1 {
+		t.Fatalf("Expected only 1 msg, got %d", len(matches))
+	}
+	checkMsg(t, matches[0], "foo", "1", "", "2", "OK")
+
+	// Now check reverse.
+	leafSend("LS+ bar\r\n")
+	expectNothing(t, lc)
+	leafSend("PING\r\n")
+	leafExpect(pongRe)
+
+	send("PUB bar 2\r\nOK\r\n")
+	matches = lmsgRe.FindAllSubmatch(leafExpect(lmsgRe), -1)
+	if len(matches) != 1 {
+		t.Fatalf("Expected only 1 msg, got %d", len(matches))
+	}
+	checkLmsg(t, matches[0], "bar", "", "2", "OK")
+}
+
+func TestLeafNodeLocalizedDQ(t *testing.T) {
+	s, opts := runLeafServer()
+	defer s.Shutdown()
+
+	sl, slOpts := runSolicitLeafServer(opts)
+	defer sl.Shutdown()
+
+	checkLeafNodeConnected(t, s)
+
+	c := createClientConn(t, slOpts.Host, slOpts.Port)
+	defer c.Close()
+
+	send, expect := setupConn(t, c)
+	send("SUB foo bar 1\r\n")
+	send("SUB foo bar 2\r\n")
+	send("SUB foo bar 3\r\n")
+	send("SUB foo bar 4\r\n")
+	send("PING\r\n")
+	expect(pongRe)
+
+	// Now create another client on the main leaf server.
+	sc := createClientConn(t, opts.Host, opts.Port)
+	defer sc.Close()
+
+	sendL, expectL := setupConn(t, sc)
+	sendL("SUB foo bar 11\r\n")
+	sendL("SUB foo bar 12\r\n")
+	sendL("SUB foo bar 13\r\n")
+	sendL("SUB foo bar 14\r\n")
+	sendL("PING\r\n")
+	expectL(pongRe)
+
+	for i := 0; i < 10; i++ {
+		send("PUB foo 2\r\nOK\r\n")
+	}
+	expectNothing(t, sc)
+
+	matches := msgRe.FindAllSubmatch(expect(msgRe), -1)
+	if len(matches) != 10 {
+		t.Fatalf("Expected 10 msgs, got %d", len(matches))
+	}
+	for i := 0; i < 10; i++ {
+		checkMsg(t, matches[i], "foo", "", "", "2", "OK")
+	}
+}

@@ -54,7 +54,6 @@ func TestDefaultOptions(t *testing.T) {
 		MaxPayload:       MAX_PAYLOAD_SIZE,
 		MaxPending:       MAX_PENDING_SIZE,
 		WriteDeadline:    DEFAULT_FLUSH_DEADLINE,
-		RQSubsSweep:      DEFAULT_REMOTE_QSUBS_SWEEPER,
 		MaxClosedClients: DEFAULT_MAX_CLOSED_CLIENTS,
 		LameDuckDuration: DEFAULT_LAME_DUCK_DURATION,
 	}

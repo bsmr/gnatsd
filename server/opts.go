@@ -80,6 +80,30 @@ type RemoteGatewayOpts struct {
 	URLs       []*url.URL  `json:"urls,omitempty"`
 }
 
+// LeafNodeOpts are options for a given server to accept leaf node connections.
+type LeafNodeOpts struct {
+	Host        string            `json:"addr,omitempty"`
+	Port        int               `json:"port,omitempty"`
+	Username    string            `json:"-"`
+	Password    string            `json:"-"`
+	AuthTimeout float64           `json:"auth_timeout,omitempty"`
+	TLSConfig   *tls.Config       `json:"-"`
+	TLSTimeout  float64           `json:"tls_timeout,omitempty"`
+	TLSMap      bool              `json:"-"`
+	Remotes     []*RemoteLeafOpts `json:"remotes,omitempty"`
+	Advertise   string            `json:"-"`
+	NoAdvertise bool              `json:"-"`
+}
+
+// RemoteLeaftOpts are options for connecting to a remote server as a leaf node.
+type RemoteLeafOpts struct {
+	LocalAccount string      `json:"local_account,omitempty"`
+	TLSConfig    *tls.Config `json:"-"`
+	TLSTimeout   float64     `json:"tls_timeout,omitempty"`
+	URL          *url.URL    `json:"url,omitempty"`
+	// FIXME(dlc) - Add in creds based auth.
+}
+
 // Options block for gnatsd server.
 type Options struct {
 	ConfigFile       string        `json:"-"`
@@ -112,6 +136,7 @@ type Options struct {
 	MaxPending       int64         `json:"max_pending"`
 	Cluster          ClusterOpts   `json:"cluster,omitempty"`
 	Gateway          GatewayOpts   `json:"gateway,omitempty"`
+	LeafNode         LeafNodeOpts  `json:"leaf_node,omitempty"`
 	ProfPort         int           `json:"-"`
 	PidFile          string        `json:"-"`
 	PortsFileDir     string        `json:"-"`
@@ -129,7 +154,6 @@ type Options struct {
 	TLSCaCert        string        `json:"-"`
 	TLSConfig        *tls.Config   `json:"-"`
 	WriteDeadline    time.Duration `json:"-"`
-	RQSubsSweep      time.Duration `json:"-"` // Deprecated
 	MaxClosedClients int           `json:"-"`
 	LameDuckDuration time.Duration `json:"-"`
 
@@ -427,6 +451,12 @@ func (o *Options) ProcessConfigFile(configFile string) error {
 			}
 		case "gateway":
 			if err := parseGateway(tk, o, &errors, &warnings); err != nil {
+				errors = append(errors, err)
+				continue
+			}
+		case "leaf", "leafnodes":
+			err := parseLeafNodes(tk, o, &errors, &warnings)
+			if err != nil {
 				errors = append(errors, err)
 				continue
 			}
@@ -877,6 +907,123 @@ func parseGateway(v interface{}, o *Options, errors *[]error, warnings *[]error)
 			o.Gateway.Gateways = gateways
 		case "reject_unknown":
 			o.Gateway.RejectUnknown = mv.(bool)
+		default:
+			if !tk.IsUsedVariable() {
+				err := &unknownConfigFieldErr{
+					field: mk,
+					configErr: configErr{
+						token: tk,
+					},
+				}
+				*errors = append(*errors, err)
+				continue
+			}
+		}
+	}
+	return nil
+}
+
+// parseCluster will parse the cluster config.
+func parseLeafNodes(v interface{}, opts *Options, errors *[]error, warnings *[]error) error {
+	tk, v := unwrapValue(v)
+	cm, ok := v.(map[string]interface{})
+	if !ok {
+		return &configErr{tk, fmt.Sprintf("Expected map to define a leafnode, got %T", v)}
+	}
+
+	for mk, mv := range cm {
+		// Again, unwrap token value if line check is required.
+		tk, mv = unwrapValue(mv)
+		switch strings.ToLower(mk) {
+		case "listen":
+			hp, err := parseListen(mv)
+			if err != nil {
+				err := &configErr{tk, err.Error()}
+				*errors = append(*errors, err)
+				continue
+			}
+			opts.LeafNode.Host = hp.host
+			opts.LeafNode.Port = hp.port
+		case "port":
+			opts.LeafNode.Port = int(mv.(int64))
+		case "host", "net":
+			opts.LeafNode.Host = mv.(string)
+		case "authorization":
+			auth, err := parseAuthorization(tk, opts, errors, warnings)
+			if err != nil {
+				*errors = append(*errors, err)
+				continue
+			}
+			if auth.users != nil {
+				err := &configErr{tk, fmt.Sprintf("Leafnode authorization does not allow multiple users")}
+				*errors = append(*errors, err)
+				continue
+			}
+			opts.LeafNode.Username = auth.user
+			opts.LeafNode.Password = auth.pass
+			opts.LeafNode.AuthTimeout = auth.timeout
+
+			if auth.defaultPermissions != nil {
+				err := &configWarningErr{
+					field: mk,
+					configErr: configErr{
+						token:  tk,
+						reason: `setting "permissions" within leafnode authorization block is deprecated`,
+					},
+				}
+				*warnings = append(*warnings, err)
+			}
+		case "remote", "remotes":
+			// Could be a single or an array.
+			ra, ok := mv.([]interface{})
+			if !ok {
+				r, ok := mv.(string)
+				if ok {
+					rurl, err := parseURL(r, "leafnode")
+					if err != nil {
+						*errors = append(*errors, err)
+						continue
+					}
+					opts.LeafNode.Remotes = []*RemoteLeafOpts{&RemoteLeafOpts{URL: rurl}}
+				} else {
+					err := &configErr{tk, fmt.Sprintf("Remote definition for a leaf node must be a URL or []URL")}
+					*errors = append(*errors, err)
+					continue
+				}
+			}
+			remotes, errs := parseURLs(ra, "leafnode")
+			if errs != nil {
+				*errors = append(*errors, errs...)
+				continue
+			}
+			opts.LeafNode.Remotes = make([]*RemoteLeafOpts, len(remotes), 0)
+			for _, rurl := range remotes {
+				opts.LeafNode.Remotes = append(opts.LeafNode.Remotes, &RemoteLeafOpts{URL: rurl})
+			}
+		case "tls":
+			config, tlsopts, err := getTLSConfig(tk)
+			if err != nil {
+				*errors = append(*errors, err)
+				continue
+			}
+			opts.LeafNode.TLSConfig = config
+			opts.LeafNode.TLSTimeout = tlsopts.Timeout
+			opts.LeafNode.TLSMap = tlsopts.Map
+		case "leafnode_advertise", "advertise":
+			opts.LeafNode.Advertise = mv.(string)
+		case "no_advertise":
+			opts.LeafNode.NoAdvertise = mv.(bool)
+			trackExplicitVal(opts, &opts.inConfig, "LeafNode.NoAdvertise", opts.LeafNode.NoAdvertise)
+			/*
+				case "permissions":
+					perms, err := parseUserPermissions(mv, errors, warnings)
+					if err != nil {
+						*errors = append(*errors, err)
+						continue
+					}
+					// This will possibly override permissions that were define in auth block
+					setClusterPermissions(&opts.Cluster, perms)
+			*/
 		default:
 			if !tk.IsUsedVariable() {
 				err := &unknownConfigFieldErr{
@@ -2177,6 +2324,17 @@ func setBaselineOptions(opts *Options) {
 			opts.Cluster.AuthTimeout = float64(AUTH_TIMEOUT) / float64(time.Second)
 		}
 	}
+	if opts.LeafNode.Port != 0 {
+		if opts.LeafNode.Host == "" {
+			opts.LeafNode.Host = DEFAULT_HOST
+		}
+		if opts.LeafNode.TLSTimeout == 0 {
+			opts.LeafNode.TLSTimeout = float64(TLS_TIMEOUT) / float64(time.Second)
+		}
+		if opts.LeafNode.AuthTimeout == 0 {
+			opts.LeafNode.AuthTimeout = float64(AUTH_TIMEOUT) / float64(time.Second)
+		}
+	}
 	if opts.MaxControlLine == 0 {
 		opts.MaxControlLine = MAX_CONTROL_LINE_SIZE
 	}
@@ -2188,9 +2346,6 @@ func setBaselineOptions(opts *Options) {
 	}
 	if opts.WriteDeadline == time.Duration(0) {
 		opts.WriteDeadline = DEFAULT_FLUSH_DEADLINE
-	}
-	if opts.RQSubsSweep == time.Duration(0) {
-		opts.RQSubsSweep = DEFAULT_REMOTE_QSUBS_SWEEPER
 	}
 	if opts.MaxClosedClients == 0 {
 		opts.MaxClosedClients = DEFAULT_MAX_CLOSED_CLIENTS
