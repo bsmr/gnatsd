@@ -757,7 +757,6 @@ func parseCluster(v interface{}, opts *Options, errors *[]error, warnings *[]err
 				*errors = append(*errors, err)
 				continue
 			}
-			config.InsecureSkipVerify = tlsopts.Insecure
 			opts.Cluster.TLSConfig = config
 			opts.Cluster.TLSTimeout = tlsopts.Timeout
 			opts.Cluster.TLSMap = tlsopts.Map
@@ -1944,6 +1943,7 @@ func GenTLSConfig(tc *TLSConfigOpts) (*tls.Config, error) {
 		PreferServerCipherSuites: true,
 		CurvePreferences:         tc.CurvePreferences,
 		Certificates:             []tls.Certificate{cert},
+		InsecureSkipVerify:       tc.Insecure,
 	}
 
 	// Require client certificates as needed
