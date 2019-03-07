@@ -45,7 +45,6 @@ type ClusterOpts struct {
 	TLSTimeout     float64           `json:"-"`
 	TLSConfig      *tls.Config       `json:"-"`
 	TLSMap         bool              `json:"-"`
-	TLSInsecure    bool              `json:"tls_insecure,omitempty"`
 	ListenStr      string            `json:"-"`
 	Advertise      string            `json:"-"`
 	NoAdvertise    bool              `json:"-"`
@@ -234,7 +233,7 @@ type TLSConfigOpts struct {
 	KeyFile          string
 	CaFile           string
 	Verify           bool
-	TLSInsecure      bool
+	Insecure         bool
 	Map              bool
 	Timeout          float64
 	Ciphers          []uint16
@@ -758,10 +757,7 @@ func parseCluster(v interface{}, opts *Options, errors *[]error, warnings *[]err
 				*errors = append(*errors, err)
 				continue
 			}
-			if val, exists := FlagSnapshot.inCmdLine["Cluster.TLSInsecure"]; exists {
-				config.InsecureSkipVerify = val
-			}
-			opts.Cluster.TLSInsecure = config.InsecureSkipVerify
+			config.InsecureSkipVerify = tlsopts.Insecure
 			opts.Cluster.TLSConfig = config
 			opts.Cluster.TLSTimeout = tlsopts.Timeout
 			opts.Cluster.TLSMap = tlsopts.Map
@@ -1857,8 +1853,7 @@ func parseTLS(v interface{}) (*TLSConfigOpts, error) {
 			if !ok {
 				return nil, &configErr{tk, fmt.Sprintf("error parsing tls config, expected 'insecure' to be a boolean")}
 			}
-			tc.TLSInsecure = insecure
-
+			tc.Insecure = insecure
 		case "verify":
 			verify, ok := mv.(bool)
 			if !ok {
@@ -1949,7 +1944,6 @@ func GenTLSConfig(tc *TLSConfigOpts) (*tls.Config, error) {
 		PreferServerCipherSuites: true,
 		CurvePreferences:         tc.CurvePreferences,
 		Certificates:             []tls.Certificate{cert},
-		InsecureSkipVerify:       tc.TLSInsecure,
 	}
 
 	// Require client certificates as needed
@@ -2038,9 +2032,6 @@ func MergeOptions(fileOpts, flagOpts *Options) *Options {
 	}
 	if flagOpts.Cluster.Advertise != "" {
 		opts.Cluster.Advertise = flagOpts.Cluster.Advertise
-	}
-	if flagOpts.Cluster.TLSInsecure {
-		opts.Cluster.TLSInsecure = true
 	}
 	if flagOpts.RoutesStr != "" {
 		mergeRoutes(&opts, flagOpts)
@@ -2287,7 +2278,6 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 	fs.StringVar(&opts.Cluster.ListenStr, "cluster", "", "Cluster url from which members can solicit routes.")
 	fs.StringVar(&opts.Cluster.ListenStr, "cluster_listen", "", "Cluster url from which members can solicit routes.")
 	fs.StringVar(&opts.Cluster.Advertise, "cluster_advertise", "", "Cluster URL to advertise to other servers.")
-	fs.BoolVar(&opts.Cluster.TLSInsecure, "cluster_tls_insecure", false, "Skip verification of the route's certificate chain and hostname.")
 	fs.BoolVar(&opts.Cluster.NoAdvertise, "no_advertise", false, "Advertise known cluster IPs to clients.")
 	fs.IntVar(&opts.Cluster.ConnectRetries, "connect_retries", 0, "For implicit routes, number of connect retries")
 	fs.BoolVar(&showTLSHelp, "help_tls", false, "TLS help.")
@@ -2343,8 +2333,6 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 	// Keep track of the boolean flags that were explicitly set with their value.
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
-		case "cluster_tls_insecure":
-			trackExplicitVal(FlagSnapshot, &FlagSnapshot.inCmdLine, "Cluster.TLSInsecure", FlagSnapshot.Cluster.TLSInsecure)
 		case "DV":
 			trackExplicitVal(FlagSnapshot, &FlagSnapshot.inCmdLine, "Debug", dbgAndTrace)
 			trackExplicitVal(FlagSnapshot, &FlagSnapshot.inCmdLine, "Trace", dbgAndTrace)
